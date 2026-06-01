@@ -1,0 +1,3 @@
+prediction,num_tokens,avg_normalized_gradient,avg_raw_gradient
+negative,281,0.1301182154516455,0.05518547592028392
+positive,334,0.20371128936845528,0.06346225991711288

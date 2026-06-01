@@ -1,0 +1,4 @@
+sentiment_category,num_tokens,avg_normalized_gradient,avg_raw_gradient
+negative_sentiment,15,0.3638549642773819,0.10808777237931887
+other,584,0.16361351462123092,0.05812045865156369
+positive_sentiment,16,0.2246670117510551,0.0712405692320317
