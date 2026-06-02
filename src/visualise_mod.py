@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -6,7 +7,7 @@ from datasets import load_dataset
 
 from load_model import load_model, predict, get_gradients
 
-# Optional: richer word-level alignment via surface-text reconstruction.
+
 try:
     from gradient_explorer import GradientExplorer
     _EXPLORER = GradientExplorer(aggregation="max")
@@ -15,7 +16,7 @@ except ImportError:
     _EXPLORER = None
     EXPLORER_AVAILABLE = False
 
-# Words whose gradient we do NOT care about even if numerically large.
+
 STOPWORDS = {
     "the", "a", "an", "is", "was", "were", "to", "of", "in", "on",
     "for", "with", "and", "or", "but", "that", "this", "these", "those",
@@ -27,11 +28,12 @@ STOPWORDS = {
     "should", "may", "might", "shall", "am", "are",
 }
 
-# How many top-gradient words to keep per review in the candidates file.
+
 TOP_K_PER_REVIEW = 10
+N_REVIEWS = 200
 
-N_REVIEWS = 30
 
+# Filter out stopwords, punctuation, and very short tokens
 def is_valid_word(word: str) -> bool:
     w = word.lower().strip()
     return (
@@ -50,20 +52,33 @@ def normalize_array(x: np.ndarray) -> np.ndarray:
     return (x - lo) / (hi - lo)
 
 
-def merge_tokens_to_words(tokens: list, grads: list):
-    words, word_grads = [], []
-    current_word, current_grads = "", []
+def safe_confidence(probs):
+    probs = np.asarray(probs, dtype=float)
+    if probs.ndim > 1:
+        probs = probs.reshape(-1)
 
-    for tok, grad in zip(tokens, grads):
-        if tok.startswith("##"):
-            current_word += tok[2:]
-            current_grads.append(grad)
+    return float(np.max(probs))
+
+# Merge tokens, the final word receives the maximum gradient of its sub-tokens
+def merge_tokens_to_words(tokens, grads):
+    words, word_grads = [], []
+
+    current_word = ""
+    current_grads = []
+
+    for t, g in zip(tokens, grads):
+
+        if t.startswith("##"):
+            current_word += t[2:]
+            current_grads.append(g)
+
         else:
             if current_word:
                 words.append(current_word)
                 word_grads.append(float(max(current_grads)))
-            current_word = tok
-            current_grads = [grad]
+
+            current_word = t
+            current_grads = [g]
 
     if current_word:
         words.append(current_word)
@@ -71,98 +86,111 @@ def merge_tokens_to_words(tokens: list, grads: list):
 
     return words, word_grads
 
-
+# Run sentiment prediction and gradient extraction for a review,
+# then produce a ranked list of words ordered by importance.
 def analyze_review(text: str, model, tokenizer):
+
     label, probs = predict(text, model, tokenizer)
+
     raw_grads = get_gradients(text, model, tokenizer)
-    tokens, _ = tokenizer.tokenize(text).
+    tokens, _ = tokenizer.tokenize(text)
+
     n = min(len(tokens), len(raw_grads))
-    tokens    = tokens[:n]
+    tokens = tokens[:n]
     raw_grads = raw_grads[:n]
-    norm_grads = normalize_array(raw_grads)
+
+    grad_scores = raw_grads
+
     if EXPLORER_AVAILABLE:
-        word_scores = _EXPLORER.analyse(text, norm_grads, tokenizer, top_k=0)
-        words      = [ws.word for ws in word_scores]
-        word_grads = [ws.score for ws in word_scores]
+        word_scores = _EXPLORER.analyse(text, grad_scores, tokenizer, top_k=0)
+        words = [w.word for w in word_scores]
+        word_grads = [w.score for w in word_scores]
     else:
-        words, word_grads = merge_tokens_to_words(tokens, norm_grads.tolist())
+        words, word_grads = merge_tokens_to_words(tokens, grad_scores.tolist())
 
     rows = []
-    for word, grad in zip(words, word_grads):
-        if not is_valid_word(word):
+    for w, g in zip(words, word_grads):
+        if not is_valid_word(w):
             continue
+
         rows.append({
-            "token":     word,
-            "norm_grad": round(float(grad), 6),
+            "token": w,
+            "norm_grad": float(g),
+            "prediction": label,
+            "probs": probs.tolist() if hasattr(probs, "tolist") else probs,
+            "review_text": text
         })
 
-    rows.sort(key=lambda r: r["norm_grad"], reverse=True)
+    rows.sort(key=lambda x: x["norm_grad"], reverse=True)
     return rows, label, probs
 
-def load_reviews(n: int = N_REVIEWS):
+
+def load_reviews(n=N_REVIEWS):
     ds = load_dataset("stanfordnlp/imdb")["test"].shuffle(seed=42)
     out = []
     for i, ex in enumerate(ds):
         text = re.sub(r"<br\s*/?>", " ", ex["text"])
         text = re.sub(r"\s+", " ", text).strip()
+
         out.append({
             "review_id": i,
-            "text":      text,
-            "label":     ex["label"],   # ground-truth: 0=negative, 1=positive
+            "text": text,
+            "label": ex["label"]
         })
+
         if len(out) >= n:
             break
     return out
 
 def main():
+
     print("=" * 60)
     print("GRADIENT EXTRACTION PIPELINE")
     print("=" * 60)
-
     model, tokenizer = load_model()
-    print(f"Model loaded.  GradientExplorer available: {EXPLORER_AVAILABLE}\n")
-
     reviews = load_reviews(N_REVIEWS)
-    print(f"Loaded {len(reviews)} reviews from IMDB test set.\n")
+    print(f"Loaded {len(reviews)} reviews\n")
 
     os.makedirs("outputs", exist_ok=True)
 
     global_candidates = []
     full_report = []
 
-    for review in reviews:
-        rid  = review["review_id"]
-        text = review["text"]
+    for r in reviews:
 
-        rows, label, probs = analyze_review(text, model, tokenizer)
-        conf = float(np.max(np.asarray(probs)))
-        top  = rows[:TOP_K_PER_REVIEW]
+        rows, label, probs = analyze_review(r["text"], model, tokenizer)
 
-        for r in top:
+        conf = safe_confidence(probs)
+
+        top = rows[:TOP_K_PER_REVIEW]
+
+        for item in top:
             global_candidates.append({
-                "review_id": rid,
-                "token":     r["token"],
-                "norm_grad": r["norm_grad"],
-                "label":     label,
+                "review_id": r["review_id"],
+                "token": item["token"],
+                "norm_grad": item["norm_grad"],
+                "label": label
             })
 
         full_report.append({
-            "review_id":       rid,
-            "text":            text,
-            "ground_truth":    review["label"],
+            "review_id": r["review_id"],
+            "text": r["text"],
             "predicted_label": label,
-            "confidence":      round(conf, 6),
-            "top_words": [
-                {"rank": i + 1, "word": r["token"], "norm_grad": r["norm_grad"]}
-                for i, r in enumerate(rows[:50])
-            ],
+            "confidence": conf,
+            "top_words": rows[:50]
         })
 
-        print(
-            f"  [{rid+1:>2}/{N_REVIEWS}]  pred={label}  conf={conf:.3f}  "
-            f"top='{top[0]['token'] if top else 'N/A'}'  "
-            f"grad={top[0]['norm_grad'] if top else 0:.4f}"
-        )
+        print(f"Review {r['review_id']} | conf={conf:.3f} | top={top[0]['token'] if top else 'N/A'}")
+
+    with open("outputs/all_high_gradient_candidates.json", "w") as f:
+        json.dump(global_candidates, f, indent=2)
+
+    with open("outputs/gradient_word_report.json", "w") as f:
+        json.dump(full_report, f, indent=2)
+
+    print("\nSaved:")
+    print("✔ outputs/all_high_gradient_candidates.json")
+    print("✔ outputs/gradient_word_report.json")
 
 
 if __name__ == "__main__":
